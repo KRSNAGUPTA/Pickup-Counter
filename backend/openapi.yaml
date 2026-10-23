@@ -1,0 +1,434 @@
+openapi: 3.1.0
+info:
+  title: Pickup Counter API
+  version: 1.0.0
+  description: |
+    Self-service snack counter. Customers place orders with a 120-second stock hold,
+    pay via a signed webhook, and lockers claim the order for pickup.
+
+    Money is stored and transmitted as **integer paise** everywhere. Never floats.
+
+    Two concurrency guarantees:
+    - Concurrent `POST /orders` cannot oversell: holds are atomically reserved.
+    - Concurrent `POST /orders/{id}/pickup-claim` resolves to exactly one 200 and one 409.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: products
+    description: Catalog and availability
+  - name: orders
+    description: Order placement, status, and pickup
+  - name: payments
+    description: Payment provider webhook (simulated)
+
+paths:
+  /api/health:
+    get:
+      summary: Liveness probe
+      operationId: getHealth
+      tags: [products]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean, const: true }
+
+  /api/products:
+    get:
+      summary: List products with current availability
+      description: |
+        Returns each product with `availableUnits = stockUnits - activeHolds`.
+        Expired holds are excluded automatically, so no background job is required
+        for expiry to take effect on this endpoint.
+      operationId: listProducts
+      tags: [products]
+      responses:
+        '200':
+          description: Product list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Product' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/orders:
+    post:
+      summary: Create an order and hold stock for 120 seconds
+      description: |
+        Validates the cart, then in a single Postgres transaction:
+        1. Locks the requested product rows in id-sorted order (`FOR UPDATE`).
+        2. Checks availability excluding expired holds.
+        3. On success, creates the order, order items, and stock holds.
+
+        If any line is short, the transaction is rolled back and the request
+        returns `409 INSUFFICIENT_STOCK` with `{ productId, requested, available }`.
+        Nothing is held.
+
+        `expiresInSeconds` is computed **on the server at response time**, not
+        baked in at insert time.
+      operationId: createOrder
+      tags: [orders]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrderRequest' }
+      responses:
+        '201':
+          description: Order created and stock held
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreateOrderResponse' }
+        '400':
+          description: Validation failed or unknown product
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ValidationError'
+                  - $ref: '#/components/schemas/UnknownProductError'
+        '409':
+          description: Not enough stock for at least one line
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InsufficientStockError' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/orders/{id}:
+    get:
+      summary: Get order status and remaining hold time
+      description: |
+        If the order is `pending` and its hold has expired, the status is
+        lazily flipped to `expired` in this request. `expiresInSeconds` is
+        computed at response time; it is `0` for any non-pending order.
+      operationId: getOrder
+      tags: [orders]
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+      responses:
+        '200':
+          description: Order view
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderView' }
+        '400':
+          description: Validation failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationError' }
+        '404':
+          description: Order not found
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { type: string, const: NOT_FOUND }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/orders/{id}/pickup-claim:
+    post:
+      summary: Claim a paid order for pickup (locker)
+      description: |
+        Atomic state transition `paid → picked_up`. Two concurrent claims
+        resolve to exactly one success and one `409 CONFLICT`.
+
+        A successful claim, in the **same transaction**, decrements
+        `Product.stockUnits` permanently for each item and deletes the
+        order's stock holds. Unpaid, expired, or `needs_review` orders
+        cannot be claimed.
+      operationId: pickupClaim
+      tags: [orders]
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+      responses:
+        '200':
+          description: Claim succeeded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean, const: true }
+        '400':
+          description: Validation failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationError' }
+        '409':
+          description: Order is not paid, already claimed, expired, or needs review
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { type: string, const: CONFLICT }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/payments/webhook:
+    post:
+      summary: Payment provider webhook (signed)
+      description: |
+        **Signature:** `X-Signature` header is the hex HMAC-SHA256 of the
+        **raw request body bytes** using `WEBHOOK_SECRET`. Reject with `401`
+        if the signature does not match.
+
+        **Idempotency:** `eventId` is the primary key of `ProcessedWebhook`.
+        Sending the same event again returns `200 { duplicate: true }` and
+        changes nothing.
+
+        **Amount check:** if `amountPaise` does not equal the order total,
+        the order is set to `needs_review` (not `paid`); the hold is kept.
+
+        **Late payment:** if the hold has expired, the server re-acquires
+        stock under a row lock excluding the order's own hold. If units are
+        still available → `paid`. If not → `needs_review`
+        (reason `OUT_OF_STOCK_LATE_PAYMENT`).
+
+        **Response code:** all handled outcomes (paid, duplicate, mismatch,
+        unknown order, already paid) return `200`. Only a bad signature
+        returns `401`, because provider retries add no value there.
+      operationId: paymentWebhook
+      tags: [payments]
+      parameters:
+        - name: X-Signature
+          in: header
+          required: true
+          description: Hex HMAC-SHA256 of the raw request body, using `WEBHOOK_SECRET`.
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookRequest' }
+      responses:
+        '200':
+          description: Event processed (or recognised as duplicate / no-op)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookResponse' }
+        '400':
+          description: Invalid JSON or schema validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [error]
+                    properties:
+                      error: { type: string, const: INVALID_JSON }
+                  - $ref: '#/components/schemas/ValidationError'
+        '401':
+          description: Signature missing or does not match
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { type: string, const: BAD_SIGNATURE }
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  parameters:
+    OrderIdPath:
+      name: id
+      in: path
+      required: true
+      description: Order identifier (cuid)
+      schema:
+        type: string
+        minLength: 1
+
+  responses:
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error: { type: string, const: INTERNAL }
+
+  schemas:
+    Product:
+      type: object
+      required: [id, name, pricePaise, availableUnits]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        pricePaise:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Price in paise (1/100 of a rupee).
+        availableUnits:
+          type: integer
+          format: int32
+          minimum: 0
+          description: stockUnits minus quantity in active (non-expired) holds.
+
+    CreateOrderRequest:
+      type: object
+      required: [items]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [productId, quantity]
+            additionalProperties: false
+            properties:
+              productId: { type: string, minLength: 1 }
+              quantity:
+                type: integer
+                format: int32
+                minimum: 1
+      example:
+        items:
+          - productId: cmvkuqv4s00025ijs4cd1lmaa
+            quantity: 2
+
+    CreateOrderResponse:
+      type: object
+      required: [orderId, totalPaise, expiresInSeconds]
+      properties:
+        orderId: { type: string }
+        totalPaise:
+          type: integer
+          format: int32
+          minimum: 0
+        expiresInSeconds:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Seconds remaining on the hold, measured on the server at response time.
+      example:
+        orderId: cmvkvo8ok0003wajsrv8bf9f4
+        totalPaise: 6000
+        expiresInSeconds: 120
+
+    OrderItemView:
+      type: object
+      required: [productId, quantity, unitPricePaise]
+      properties:
+        productId: { type: string }
+        quantity: { type: integer, format: int32, minimum: 1 }
+        unitPricePaise: { type: integer, format: int32, minimum: 0 }
+
+    OrderView:
+      type: object
+      required: [id, status, totalPaise, items, expiresInSeconds]
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [pending, paid, picked_up, expired, needs_review]
+        totalPaise: { type: integer, format: int32, minimum: 0 }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderItemView' }
+        expiresInSeconds: { type: integer, format: int32, minimum: 0 }
+
+    WebhookRequest:
+      type: object
+      required: [eventId, orderId, amountPaise, status]
+      additionalProperties: false
+      properties:
+        eventId:
+          type: string
+          minLength: 1
+          description: Provider event id. Used as idempotency key.
+        orderId: { type: string, minLength: 1 }
+        amountPaise:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Amount captured, in paise.
+        status:
+          type: string
+          enum: [captured]
+      example:
+        eventId: evt_test_1
+        orderId: cmvkvo8ok0003wajsrv8bf9f4
+        amountPaise: 6000
+        status: captured
+
+    WebhookResponse:
+      type: object
+      description: |
+        All handled cases return 200. At most one of the boolean flags is set,
+        except `ok`.
+      required: [ok]
+      properties:
+        ok: { type: boolean, const: true }
+        paid:
+          type: boolean
+          description: Order marked paid by this event.
+        duplicate:
+          type: boolean
+          description: This eventId was already processed; nothing changed.
+        review:
+          type: boolean
+          description: Order moved to needs_review.
+        reason:
+          type: string
+          enum: [AMOUNT_MISMATCH, OUT_OF_STOCK_LATE_PAYMENT, PRODUCT_GONE]
+        ignored:
+          type: string
+          enum: [no_order]
+          description: eventId refers to an order that does not exist.
+        already:
+          type: string
+          enum: [paid, picked_up]
+          description: Order was already in a terminal-or-paid state.
+
+    ValidationError:
+      type: object
+      required: [error, details]
+      properties:
+        error: { type: string, const: VALIDATION_FAILED }
+        details:
+          type: array
+          description: Zod issue objects
+          items:
+            type: object
+            additionalProperties: true
+
+    UnknownProductError:
+      type: object
+      required: [error, productId]
+      properties:
+        error: { type: string, const: UNKNOWN_PRODUCT }
+        productId: { type: string }
+
+    InsufficientStockError:
+      type: object
+      required: [error, productId, requested, available]
+      properties:
+        error: { type: string, const: INSUFFICIENT_STOCK }
+        productId: { type: string }
+        requested: { type: integer, format: int32, minimum: 1 }
+        available: { type: integer, format: int32, minimum: 0 }
