@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Product {
+  id         String @id @default(cuid())
+  name       String
+  pricePaise Int
+  stockUnits Int
+}
+
+model Order {
+  id              String   @id @default(cuid())
+  totalPaise      Int
+  status          String   @default("pending")
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime
+  paidAt          DateTime?
+  pickupClaimedAt DateTime?
+  items           OrderItem[]
+  holds           StockHold[]
+}
+
+model OrderItem {
+  id             String @id @default(cuid())
+  orderId        String
+  productId      String
+  quantity       Int
+  unitPricePaise Int
+  order          Order @relation(fields: [orderId], references: [id])
+}
+
+model StockHold {
+  id        String   @id @default(cuid())
+  orderId   String
+  productId String
+  quantity  Int
+  expiresAt DateTime
+  order     Order    @relation(fields: [orderId], references: [id])
+
+  @@index([productId])
+}
+
+model ProcessedWebhook {
+  eventId    String   @id
+  orderId    String
+  receivedAt DateTime @default(now())
+}
