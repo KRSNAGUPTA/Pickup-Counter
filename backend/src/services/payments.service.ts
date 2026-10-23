@@ -103,3 +103,33 @@ export async function processWebhook(event: WebhookInput): Promise<WebhookResult
     return { ok: true, paid: true };
   });
 }
+
+/**
+ * Mock payment provider: sign a webhook body and deliver it to our own
+ * /api/payments/webhook. Used only by the customer screen's Pay button so a
+ * reviewer can exercise the full flow from the browser. The real webhook is
+ * still the only endpoint that mutates order state.
+ */
+export async function simulateProviderWebhook(input: {
+  orderId: string;
+  amountPaise: number;
+  eventId?: string;
+}): Promise<{ status: number; body: unknown }> {
+  const eventId = input.eventId ?? `evt_sim_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const body = JSON.stringify({
+    eventId,
+    orderId: input.orderId,
+    amountPaise: input.amountPaise,
+    status: 'captured',
+  });
+  const secret = process.env.WEBHOOK_SECRET ?? 'devsecret';
+  const signature = crypto.createHmac('sha256', secret).update(body).digest('hex');
+
+  const port = Number(process.env.PORT ?? 3000);
+  const res = await fetch(`http://localhost:${port}/api/payments/webhook`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-signature': signature },
+    body,
+  });
+  return { status: res.status, body: await res.json() };
+}

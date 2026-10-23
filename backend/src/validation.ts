@@ -30,3 +30,10 @@ export const WebhookSchema = z.object({
 });
 
 export type WebhookInput = z.infer<typeof WebhookSchema>;
+
+export const SimulateSchema = z.object({
+  orderId: z.string().min(1),
+  amountPaise: z.number().int().nonnegative(),
+  eventId: z.string().min(1).optional(),
+});
+export type SimulateInput = z.infer<typeof SimulateSchema>;

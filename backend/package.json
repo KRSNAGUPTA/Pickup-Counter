@@ -5,8 +5,8 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc",
-    "start:dev": "tsx src/index.ts --watch",
-    "start:prod": "node dist/src/index.js",
+    "start:dev": "tsx index.ts --watch",
+    "start:prod": "node dist/index.js",
     "seed": "tsx prisma/seed.ts",
     "send-webhook": "tsx scripts/send-webhook.ts",
     "test": "vitest run",

@@ -19,18 +19,21 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DIRECT_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET}
-      PORT: ${BACKEND_PORT}
+      PORT: 3000
     ports:
-      - "${BACKEND_PORT}:${BACKEND_PORT}"
+      - "3000:3000"
     depends_on:
       db:
         condition: service_healthy
 
-  frontend:
-    build: ./frontend
+  client:
+    build: ./client
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:3000
     ports:
-      - "${FRONTEND_PORT}:${FRONTEND_PORT}"
+      - "5173:5173"
     depends_on:
       - backend
 
